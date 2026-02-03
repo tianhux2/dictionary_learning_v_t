@@ -393,8 +393,6 @@ class JumpReluTranscoderAutoEncoder(Dictionary, nn.Module):
         x = x.to(dtype=self.W_enc.dtype, device=self.W_enc.device)
         pre_jump = x @ self.W_enc + self.b_enc
 
-        print((pre_jump > self.threshold).float().sum(dim=-1))
-
         f = nn.ReLU()(pre_jump * (pre_jump > self.threshold))
 
         if output_pre_jump:
@@ -418,10 +416,64 @@ class JumpReluTranscoderAutoEncoder(Dictionary, nn.Module):
         else:
             return x_hat
 
-    def scale_biases(self, scale: float):
-        self.b_dec.data *= scale
-        self.b_enc.data *= scale
-        self.threshold.data *= scale
+    @t.no_grad()
+    def fold_activation_normalization(self, mu_in, scale_in, mu_out, scale_out):
+        """
+        将归一化参数折叠进模型权重中，使得推理时可以直接输入原始数据。
+        Encoder: 吸收 Input 的 (x - mu_in) / scale_in
+        Decoder: 吸收 Output 的 y * scale_out + mu_out
+        """
+        # 确保统计量在正确的设备上
+        mu_in = mu_in.to(self.W_enc.device)
+        mu_out = mu_out.to(self.W_dec.device)
+
+        # --- 处理 Encoder ---
+        # 原始计算: f = ReLU(W_enc * ((x - mu_in)/scale_in) + b_enc)
+        # 折叠后:   f = ReLU((W_enc/scale_in) * x + (b_enc - (W_enc/scale_in)*mu_in))
+        
+        # 1. 缩放权重 W_new = W_old / scale_in
+        self.W_enc.data /= scale_in
+        
+        # 2. 调整偏置 b_new = b_old - W_new @ mu_in
+        # 注意：此时 self.W_enc 已经是 W_new 了
+        bias_adjustment_enc = self.W_enc.data @ mu_in
+        self.b_enc.data -= bias_adjustment_enc
+
+        # --- 处理 Decoder ---
+        # 原始计算: y_norm = W_dec * f + b_dec
+        # 目标输出: y_raw = y_norm * scale_out + mu_out
+        # 折叠后:   y_raw = (W_dec * scale_out) * f + (b_dec * scale_out + mu_out)
+
+        # 1. 缩放权重 W_new = W_old * scale_out
+        self.W_dec.data *= scale_out
+        
+        # 2. 调整偏置 b_new = b_old * scale_out + mu_out
+        self.b_dec.data *= scale_out
+        self.b_dec.data += mu_out
+
+    @t.no_grad()
+    def unfold_activation_normalization(self, mu_in, scale_in, mu_out, scale_out):
+        """
+        fold_activation_normalization 的逆操作，用于在保存 checkpoint 后恢复权重以继续训练。
+        """
+        mu_in = mu_in.to(self.W_enc.device)
+        mu_out = mu_out.to(self.W_dec.device)
+
+        # --- 恢复 Decoder ---
+        # b_old = (b_new - mu_out) / scale_out
+        self.b_dec.data -= mu_out
+        self.b_dec.data /= scale_out
+        
+        # W_old = W_new / scale_out
+        self.W_dec.data /= scale_out
+
+        # --- 恢复 Encoder ---
+        # b_old = b_new + W_new @ mu_in (注意此时 self.W_enc 仍是 W_new)
+        bias_adjustment_enc = self.W_enc.data @ mu_in
+        self.b_enc.data += bias_adjustment_enc
+        
+        # W_old = W_new * scale_in
+        self.W_enc.data *= scale_in
 
     @classmethod
     def from_pretrained(

@@ -168,7 +168,7 @@ def evaluate(
     out = defaultdict(float)
     active_features = t.zeros(dictionary.dict_size, dtype=t.float32, device=device)
 
-    uu = 0
+    n_rec0 = 0
 
     for _ in tqdm.tqdm(range(n_batches)):
         try:
@@ -246,13 +246,13 @@ def evaluate(
         out["loss_reconstructed"] += loss_reconstructed.item()
         out["loss_zero"] += loss_zero.item()
         if t.isnan(frac_recovered):
-            uu += 1
+            n_rec0 += 1
         else:
             out["frac_recovered"] += frac_recovered.item()
 
     cc = out["frac_recovered"]
     out = {key: value / n_batches for key, value in out.items()}
-    out["frac_recovered"] = cc / (n_batches - uu)
+    out["frac_recovered"] = cc / (n_batches - n_rec0)
     frac_alive = (active_features != 0).float().sum() / dictionary.dict_size
     out["frac_alive"] = frac_alive.item()
 
