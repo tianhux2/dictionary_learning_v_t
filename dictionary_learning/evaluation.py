@@ -8,6 +8,7 @@ from collections import defaultdict
 from .buffer import ActivationBuffer, NNsightActivationBuffer
 from nnsight import LanguageModel
 from .config import DEBUG
+import tqdm
 
 
 def loss_recovered(
@@ -40,12 +41,11 @@ def loss_recovered(
         output_is_tuple = True
 
     # unmodified logits
-    with model.trace(text, invoker_args=invoker_args):
+    with model.trace(text, **invoker_args):
         logits_original = model.output.save()
-    logits_original = logits_original.value
     
     # logits when replacing component activations with reconstruction by autoencoder
-    with model.trace(text, **tracer_args, invoker_args=invoker_args):
+    with model.trace(text, **tracer_args, **invoker_args):
         if io == 'in':
             x = submodule.input
             if normalize_batch:
@@ -72,7 +72,7 @@ def loss_recovered(
     x_hat = dictionary(x).to(model.dtype)
 
     # intervene with `x_hat`
-    with model.trace(text, **tracer_args, invoker_args=invoker_args):
+    with model.trace(text, **tracer_args, **invoker_args):
         if io == 'in':
             x = submodule.input
             if normalize_batch:
@@ -102,10 +102,11 @@ def loss_recovered(
             raise ValueError(f"Invalid value for io: {io}")
 
         logits_reconstructed = model.output.save()
-    logits_reconstructed = logits_reconstructed.value
 
     # logits when replacing component activations with zeros
-    with model.trace(text, **tracer_args, invoker_args=invoker_args):
+    with model.trace(text, **tracer_args, **invoker_args):
+        input = model.inputs.save()
+        
         if io == 'in':
             x = submodule.input
             submodule.input[:] = t.zeros_like(x)
@@ -118,10 +119,8 @@ def loss_recovered(
         else:
             raise ValueError(f"Invalid value for io: {io}")
         
-        input = model.inputs.save()
         logits_zero = model.output.save()
 
-    logits_zero = logits_zero.value
 
     # get everything into the right format
     try:
@@ -169,17 +168,28 @@ def evaluate(
     out = defaultdict(float)
     active_features = t.zeros(dictionary.dict_size, dtype=t.float32, device=device)
 
-    for _ in range(n_batches):
+    uu = 0
+
+    for _ in tqdm.tqdm(range(n_batches)):
         try:
             x = next(activations).to(device)
+            if x.ndim == 3 and x.shape[1] == 2:
+                x_in, x_out = x.unbind(dim=1) 
+            else:
+                x_in = x
+                x_out = x
             if normalize_batch:
-                x = x / x.norm(dim=-1).mean() * (dictionary.activation_dim ** 0.5)
+                scale = (dictionary.activation_dim ** 0.5) / x_in.norm(dim=-1).mean()
+                x_in = x_in * scale
+                x_out = x_out * scale
         except StopIteration:
             raise StopIteration(
                 "Not enough activations in buffer. Pass a buffer with a smaller batch size or more data."
             )
-        x_hat, f = dictionary(x, output_features=True)
-        l2_loss = t.linalg.norm(x - x_hat, dim=-1).mean()
+        x_hat, f = dictionary(x_in, output_features=True)
+
+        x_hat = x_hat.to(x_out.device)
+        l2_loss = t.linalg.norm(x_out - x_hat, dim=-1).mean()
         l1_loss = f.norm(p=1, dim=-1).mean()
         l0 = (f != 0).float().sum(dim=-1).mean()
         
@@ -187,24 +197,25 @@ def evaluate(
         assert features_BF.shape[-1] == dictionary.dict_size
         assert len(features_BF.shape) == 2
 
+        features_BF = features_BF.to(active_features.device)
         active_features += features_BF.sum(dim=0)
 
         # cosine similarity between x and x_hat
-        x_normed = x / t.linalg.norm(x, dim=-1, keepdim=True)
+        x_out_normed = x_out / t.linalg.norm(x_out, dim=-1, keepdim=True)
         x_hat_normed = x_hat / t.linalg.norm(x_hat, dim=-1, keepdim=True)
-        cossim = (x_normed * x_hat_normed).sum(dim=-1).mean()
+        cossim = (x_out_normed * x_hat_normed).sum(dim=-1).mean()
 
         # l2 ratio
-        l2_ratio = (t.linalg.norm(x_hat, dim=-1) / t.linalg.norm(x, dim=-1)).mean()
+        l2_ratio = (t.linalg.norm(x_hat, dim=-1) / t.linalg.norm(x_out, dim=-1)).mean()
 
         #compute variance explained
-        total_variance = t.var(x, dim=0).sum()
-        residual_variance = t.var(x - x_hat, dim=0).sum()
+        total_variance = t.var(x_out, dim=0).sum()
+        residual_variance = t.var(x_out - x_hat, dim=0).sum()
         frac_variance_explained = (1 - residual_variance / total_variance)
 
         # Equation 10 from https://arxiv.org/abs/2404.16014
         x_hat_norm_squared = t.linalg.norm(x_hat, dim=-1, ord=2)**2
-        x_dot_x_hat = (x * x_hat).sum(dim=-1)
+        x_dot_x_hat = (x_out * x_hat).sum(dim=-1)
         relative_reconstruction_bias = x_hat_norm_squared.mean() / x_dot_x_hat.mean()
 
         out["l2_loss"] += l2_loss.item()
@@ -215,8 +226,8 @@ def evaluate(
         out["l2_ratio"] += l2_ratio.item()
         out['relative_reconstruction_bias'] += relative_reconstruction_bias.item()
 
-        if not isinstance(activations, (ActivationBuffer, NNsightActivationBuffer)):
-            continue
+        # if not isinstance(activations, (ActivationBuffer, NNsightActivationBuffer)):
+        #     continue
 
         # compute loss recovered
         loss_original, loss_reconstructed, loss_zero = loss_recovered(
@@ -234,9 +245,14 @@ def evaluate(
         out["loss_original"] += loss_original.item()
         out["loss_reconstructed"] += loss_reconstructed.item()
         out["loss_zero"] += loss_zero.item()
-        out["frac_recovered"] += frac_recovered.item()
+        if t.isnan(frac_recovered):
+            uu += 1
+        else:
+            out["frac_recovered"] += frac_recovered.item()
 
+    cc = out["frac_recovered"]
     out = {key: value / n_batches for key, value in out.items()}
+    out["frac_recovered"] = cc / (n_batches - uu)
     frac_alive = (active_features != 0).float().sum() / dictionary.dict_size
     out["frac_alive"] = frac_alive.item()
 
